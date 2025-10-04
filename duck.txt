@@ -1,0 +1,519 @@
+// proc_enum.cpp
+#define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <stdio.h>
+#include <wchar.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <string>
+
+#pragma comment(lib, "psapi.lib")
+
+// NT minimal typedefs 
+typedef LONG NTSTATUS;
+#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+
+typedef struct _CLIENT_ID { HANDLE UniqueProcess; HANDLE UniqueThread; } CLIENT_ID, * PCLIENT_ID;
+
+typedef struct _UNICODE_STRING {
+    USHORT Length; USHORT MaximumLength; PWSTR Buffer;
+} UNICODE_STRING, * PUNICODE_STRING;
+
+typedef LONG KPRIORITY;
+
+typedef enum _KTHREAD_STATE {
+    StateInitialized, StateReady, StateRunning, StateStandby, StateTerminated,
+    StateWaiting, StateTransition, StateDeferredReady, StateGateWaitObsolete,
+    StateWaitingForProcessInSwap
+} KTHREAD_STATE;
+
+typedef enum _KWAIT_REASON {
+    Executive, FreePage, PageIn, PoolAllocation, DelayExecution, Suspended,
+    UserRequest, WrExecutive, WrFreePage, WrPageIn, WrPoolAllocation,
+    WrDelayExecution, WrSuspended, WrUserRequest, WrEventPair, WrQueue,
+    WrLpcReceive, WrLpcReply, WrVirtualMemory, WrPageOut, WrRendezvous,
+    WrKeyedEvent, WrTerminated, WrProcessInSwap, WrCpuRateControl,
+    WrCalloutStack, WrKernel, WrResource, WrPushLock, WrMutex, WrQuantumEnd,
+    WrDispatchInt, WrPreempted, WrYieldExecution, WrFastMutex, WrGuardedMutex,
+    WrRundown, WrAlertByThreadId, WrDeferredPreempt, WrPhysicalFault,
+    WrIoRing, WrMdlCache, WrRcu, WrAppState
+} KWAIT_REASON;
+
+typedef struct _SYSTEM_THREAD_INFORMATION {
+    LARGE_INTEGER KernelTime, UserTime, CreateTime;
+    ULONG WaitTime;
+#ifdef _WIN64
+    ULONG_PTR StartAddress;
+#else
+    PVOID StartAddress;
+#endif
+    CLIENT_ID ClientId;
+    LONG Priority, BasePriority;
+    ULONG ContextSwitches;
+    KTHREAD_STATE ThreadState;
+    KWAIT_REASON WaitReason;
+} SYSTEM_THREAD_INFORMATION, * PSYSTEM_THREAD_INFORMATION;
+
+typedef enum _PROCESSINFOCLASS { ProcessBasicInformation = 0, ProcessWow64Information = 26 } PROCESSINFOCLASS;
+
+typedef struct _PROCESS_BASIC_INFORMATION {
+    PVOID Reserved1, PebBaseAddress, Reserved2[2];
+    ULONG_PTR UniqueProcessId;
+    PVOID InheritedFromUniqueProcessId; // PPID
+} PROCESS_BASIC_INFORMATION;
+
+typedef NTSTATUS(NTAPI* PFN_NtQuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+typedef NTSTATUS(NTAPI* PFN_NtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+
+// SystemProcessInformation (header)
+typedef struct _SYSTEM_PROCESS_INFORMATION_HEAD {
+    ULONG NextEntryOffset, NumberOfThreads;
+    LARGE_INTEGER WorkingSetPrivateSize; ULONG HardFaultCount, NumberOfThreadsHighWatermark; ULONGLONG CycleTime;
+    LARGE_INTEGER CreateTime, UserTime, KernelTime;
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId, InheritedFromUniqueProcessId;
+    ULONG HandleCount, SessionId; ULONG_PTR UniqueProcessKey;
+    SIZE_T PeakVirtualSize, VirtualSize;
+    ULONG PageFaultCount; SIZE_T PeakWorkingSetSize, WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage, QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage, PeakPagefileUsage, PrivatePageCount;
+    LARGE_INTEGER ReadOperationCount, WriteOperationCount, OtherOperationCount;
+    LARGE_INTEGER ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    // followed by SYSTEM_THREAD_INFORMATION[NumberOfThreads]
+} SYSTEM_PROCESS_INFORMATION_HEAD, * PSYSTEM_PROCESS_INFORMATION_HEAD;
+
+// ===== PEB/params tối thiểu =====
+typedef struct _UNICODE_STRING32 { USHORT Length, MaximumLength; ULONG Buffer; } UNICODE_STRING32;
+typedef struct _UNICODE_STRING64 { USHORT Length, MaximumLength; ULONGLONG Buffer; } UNICODE_STRING64;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS64_MIN { BYTE Reserved1[0x70]; UNICODE_STRING64 CommandLine; } RTL_USER_PROCESS_PARAMETERS64_MIN;
+typedef struct _PEB64_MIN { BYTE Reserved1[0x20]; ULONGLONG ProcessParameters; } PEB64_MIN;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS32_MIN { BYTE Reserved1[0x70]; UNICODE_STRING32 CommandLine; } RTL_USER_PROCESS_PARAMETERS32_MIN;
+typedef struct _PEB32_MIN { BYTE Reserved1[0x10]; ULONG ProcessParameters; } PEB32_MIN;
+
+// ===== Globals & forward decls =====
+static PFN_NtQuerySystemInformation pNtQuerySystemInformation = NULL;
+static PFN_NtQueryInformationProcess pNtQueryInformationProcess = NULL;
+typedef BOOL(WINAPI* PFN_IsWow64Process2)(HANDLE, USHORT*, USHORT*);
+
+static FILE* gLog = NULL;
+static void WPRINT(const wchar_t* fmt, ...);
+
+// ===== print to console + file =====
+static void vwprint_both(const wchar_t* fmt, va_list ap) {
+    vwprintf(fmt, ap);
+    if (gLog) {
+        va_list ap2; va_copy(ap2, ap);
+        vfwprintf(gLog, fmt, ap2);
+        va_end(ap2);
+        fflush(gLog);
+    }
+}
+static void WPRINT(const wchar_t* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vwprint_both(fmt, ap);
+    va_end(ap);
+}
+
+// ===== mapping enum -> string =====
+static const wchar_t* ThreadStateName(KTHREAD_STATE s) {
+    switch (s) {
+    case StateInitialized: return L"Initialized";
+    case StateReady: return L"Ready";
+    case StateRunning: return L"Running";
+    case StateStandby: return L"Standby";
+    case StateTerminated: return L"Terminated";
+    case StateWaiting: return L"Waiting";
+    case StateTransition: return L"Transition";
+    case StateDeferredReady: return L"DeferredReady";
+    case StateGateWaitObsolete: return L"GateWait";
+    case StateWaitingForProcessInSwap: return L"ProcInSwap";
+    default: return L"?";
+    }
+}
+static void WaitReasonToString(KWAIT_REASON r, wchar_t* out, size_t cch) {
+    const wchar_t* name = nullptr;
+    switch (r) {
+    case Executive: name = L"Executive"; break; case FreePage: name = L"FreePage"; break;
+    case PageIn: name = L"PageIn"; break; case PoolAllocation: name = L"PoolAllocation"; break;
+    case DelayExecution: name = L"DelayExecution"; break; case Suspended: name = L"Suspended"; break;
+    case UserRequest: name = L"UserRequest"; break; case WrExecutive: name = L"WrExecutive"; break;
+    case WrFreePage: name = L"WrFreePage"; break; case WrPageIn: name = L"WrPageIn"; break;
+    case WrPoolAllocation: name = L"WrPoolAllocation"; break; case WrDelayExecution: name = L"WrDelayExecution"; break;
+    case WrSuspended: name = L"WrSuspended"; break; case WrUserRequest: name = L"WrUserRequest"; break;
+    case WrEventPair: name = L"WrEventPair"; break; case WrQueue: name = L"WrQueue"; break;
+    case WrLpcReceive: name = L"WrLpcReceive"; break; case WrLpcReply: name = L"WrLpcReply"; break;
+    case WrVirtualMemory: name = L"WrVirtualMemory"; break; case WrPageOut: name = L"WrPageOut"; break;
+    case WrRendezvous: name = L"WrRendezvous"; break; case WrKeyedEvent: name = L"WrKeyedEvent"; break;
+    case WrTerminated: name = L"WrTerminated"; break; case WrProcessInSwap: name = L"WrProcessInSwap"; break;
+    case WrCpuRateControl: name = L"WrCpuRateControl"; break; case WrCalloutStack: name = L"WrCalloutStack"; break;
+    case WrKernel: name = L"WrKernel"; break; case WrResource: name = L"WrResource"; break;
+    case WrPushLock: name = L"WrPushLock"; break; case WrMutex: name = L"WrMutex"; break;
+    case WrQuantumEnd: name = L"WrQuantumEnd"; break; case WrDispatchInt: name = L"WrDispatchInt"; break;
+    case WrPreempted: name = L"WrPreempted"; break; case WrYieldExecution: name = L"WrYieldExecution"; break;
+    case WrFastMutex: name = L"WrFastMutex"; break; case WrGuardedMutex: name = L"WrGuardedMutex"; break;
+    case WrRundown: name = L"WrRundown"; break; case WrAlertByThreadId: name = L"WrAlertByThreadId"; break;
+    case WrDeferredPreempt: name = L"WrDeferredPreempt"; break; case WrPhysicalFault: name = L"WrPhysicalFault"; break;
+    case WrIoRing: name = L"WrIoRing"; break; case WrMdlCache: name = L"WrMdlCache"; break;
+    case WrRcu: name = L"WrRcu"; break; case WrAppState: name = L"WrAppState"; break;
+    default: name = nullptr; break;
+    }
+    if (name) { wcsncpy(out, name, cch - 1); out[cch - 1] = 0; }
+    else _snwprintf(out, cch, L"Unknown(%u)", (unsigned)r);
+}
+
+// ===== arch & path & cmdline =====
+static const wchar_t* ArchName(USHORT processMachine, USHORT /*native*/) {
+    switch (processMachine) { case 0x8664: return L"x64"; case 0x014c: return L"x86"; case 0xAA64: return L"ARM64"; case 0: return L"Native"; default: return L"?"; }
+}
+static void GetProcessArchitecture(HANDLE hProc, wchar_t out[16]) {
+    out[0] = 0;
+    HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+    auto pIsWow64Process2 = (PFN_IsWow64Process2)GetProcAddress(hKernel, "IsWow64Process2");
+    USHORT pm = 0, nm = 0;
+    if (pIsWow64Process2 && pIsWow64Process2(hProc, &pm, &nm)) { wcsncpy(out, ArchName(pm, nm), 15); out[15] = 0; return; }
+    BOOL isWow64 = FALSE;
+    if (IsWow64Process(hProc, &isWow64)) {
+#ifdef _WIN64
+        wcsncpy(out, isWow64 ? L"x86" : L"x64", 15);
+#else
+        wcsncpy(out, L"x86", 15);
+#endif
+        out[15] = 0; return;
+    }
+    wcsncpy(out, L"Unknown", 15); out[15] = 0;
+}
+static BOOL GetProcessImagePath(HANDLE hProc, wchar_t* buf, DWORD cch) {
+    DWORD sz = cch; if (QueryFullProcessImageNameW(hProc, 0, buf, &sz)) return TRUE;
+    if (GetModuleFileNameExW(hProc, NULL, buf, cch)) return TRUE;
+    return FALSE;
+}
+
+// ===== helpers cho phần DLL =====
+static bool SamePathNoCase(const wchar_t* a, const wchar_t* b) {
+    if (!a || !b) return false;
+    return _wcsicmp(a, b) == 0;
+}
+static bool HasDllLikeExt(const wchar_t* path) {
+    if (!path) return false;
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return false;
+    return _wcsicmp(dot, L".dll") == 0;
+}
+
+// Read UNICODE_STRING from diffrent process 
+static BOOL ReadRemoteUnicodeString(HANDLE hProc, ULONGLONG addrStrStruct, BOOL is32, wchar_t** out) {
+    *out = NULL; SIZE_T rd = 0;
+    if (is32) {
+        UNICODE_STRING32 us{};
+        if (!ReadProcessMemory(hProc, (LPCVOID)(uintptr_t)addrStrStruct, &us, sizeof(us), &rd)) return FALSE;
+        if (!us.Length || !us.Buffer) return FALSE;
+        size_t cch = us.Length / sizeof(wchar_t);
+        wchar_t* buf = (wchar_t*)malloc((cch + 1) * sizeof(wchar_t)); if (!buf) return FALSE;
+        if (!ReadProcessMemory(hProc, (LPCVOID)(uintptr_t)us.Buffer, buf, us.Length, &rd)) { free(buf); return FALSE; }
+        buf[cch] = 0; *out = buf; return TRUE;
+    }
+    else {
+        UNICODE_STRING64 us{};
+        if (!ReadProcessMemory(hProc, (LPCVOID)(uintptr_t)addrStrStruct, &us, sizeof(us), &rd)) return FALSE;
+        if (!us.Length || !us.Buffer) return FALSE;
+        size_t cch = us.Length / sizeof(wchar_t);
+        wchar_t* buf = (wchar_t*)malloc((cch + 1) * sizeof(wchar_t)); if (!buf) return FALSE;
+        if (!ReadProcessMemory(hProc, (LPCVOID)(uintptr_t)us.Buffer, buf, us.Length, &rd)) { free(buf); return FALSE; }
+        buf[cch] = 0; *out = buf; return TRUE;
+    }
+}
+static BOOL GetProcessCommandLine(HANDLE hProc, BOOL is32, wchar_t** outCmd) {
+    *outCmd = NULL; if (!pNtQueryInformationProcess) return FALSE;
+    PROCESS_BASIC_INFORMATION pbi{}; ULONG ret = 0;
+    NTSTATUS st = pNtQueryInformationProcess(hProc, ProcessBasicInformation, &pbi, sizeof(pbi), &ret);
+    if (!NT_SUCCESS(st) || !pbi.PebBaseAddress) return FALSE;
+    SIZE_T rd = 0;
+    if (is32) {
+        PEB32_MIN peb{}; if (!ReadProcessMemory(hProc, pbi.PebBaseAddress, &peb, sizeof(peb), &rd)) return FALSE;
+        if (!peb.ProcessParameters) return FALSE;
+        return ReadRemoteUnicodeString(hProc,
+            (ULONGLONG)(uintptr_t) & ((RTL_USER_PROCESS_PARAMETERS32_MIN*)0)->CommandLine + (ULONGLONG)(uintptr_t)peb.ProcessParameters,
+            TRUE, outCmd);
+    }
+    else {
+        PEB64_MIN peb{}; if (!ReadProcessMemory(hProc, pbi.PebBaseAddress, &peb, sizeof(peb), &rd)) return FALSE;
+        if (!peb.ProcessParameters) return FALSE;
+        return ReadRemoteUnicodeString(hProc,
+            (ULONGLONG) & ((RTL_USER_PROCESS_PARAMETERS64_MIN*)0)->CommandLine + (ULONGLONG)peb.ProcessParameters,
+            FALSE, outCmd);
+    }
+}
+
+//  threads 
+static BOOL PrintThreadsForPid(DWORD pid) {
+    if (!pNtQuerySystemInformation) { WPRINT(L"  [!] NtQuerySystemInformation not available\n"); return FALSE; }
+    ULONG len = 1 << 20; BYTE* buf = (BYTE*)malloc(len); if (!buf) return FALSE;
+    NTSTATUS st;
+    for (;;) {
+        st = pNtQuerySystemInformation(5 /*SystemProcessInformation*/, buf, len, &len);
+        if (st == 0xC0000004) { BYTE* nb = (BYTE*)realloc(buf, len + (1 << 18)); if (!nb) { free(buf); return FALSE; } buf = nb; continue; }
+        break;
+    }
+    if (!NT_SUCCESS(st)) { free(buf); return FALSE; }
+
+    BYTE* p = buf;
+    for (;;) {
+        auto spi = (PSYSTEM_PROCESS_INFORMATION_HEAD)p;
+        DWORD thisPid = (DWORD)(ULONG_PTR)spi->UniqueProcessId;
+        if (thisPid == pid) {
+            auto ti = (PSYSTEM_THREAD_INFORMATION)(spi + 1);
+            WPRINT(L"\n== Threads ==\n");
+            for (ULONG i = 0; i < spi->NumberOfThreads; ++i) {
+                DWORD tid = (DWORD)(ULONG_PTR)ti[i].ClientId.UniqueThread;
+                wchar_t wr[64] = L"-";
+                if (ti[i].ThreadState == StateWaiting) WaitReasonToString(ti[i].WaitReason, wr, _countof(wr));
+                WPRINT(L"TID=%lu; State=%s; WaitReason=%s\n", tid, ThreadStateName(ti[i].ThreadState), wr);
+            }
+            break;
+        }
+        if (spi->NextEntryOffset == 0) break;
+        p += spi->NextEntryOffset;
+    }
+    free(buf); return TRUE;
+}
+
+// only DLLs
+static void ListModules(DWORD pid, const wchar_t* mainImagePath) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) {
+        WPRINT(L"[!] CreateToolhelp32Snapshot(MODULE) failed (err=%lu)\n", GetLastError());
+        return;
+    }
+    MODULEENTRY32W me{}; me.dwSize = sizeof(me);
+    if (!Module32FirstW(snap, &me)) {
+        WPRINT(L"[!] Module32First failed (err=%lu)\n", GetLastError());
+        CloseHandle(snap);
+        return;
+    }
+    WPRINT(L"\n== DLLs ==\n");
+    do {
+        if (SamePathNoCase(me.szExePath, mainImagePath)) continue;   // skips main.exe
+        if (!HasDllLikeExt(me.szExePath)) continue;                  // only DLL
+        WPRINT(L"%-40s %s\n", me.szModule, me.szExePath);
+    } while (Module32NextW(snap, &me));
+    CloseHandle(snap);
+}
+
+//  PE helpers 
+static BYTE* RvaToPtr(BYTE* base, IMAGE_NT_HEADERS* nt, DWORD rva) {
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt); WORD nsec = nt->FileHeader.NumberOfSections;
+    for (WORD i = 0; i < nsec; ++i) {
+        DWORD va = sec[i].VirtualAddress;
+        DWORD sz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+        if (rva >= va && rva < va + sz) { DWORD delta = rva - va; return base + sec[i].PointerToRawData + delta; }
+    }
+    return nullptr;
+}
+
+// imports: DLL
+static void PrintImportsFromImagePath(const wchar_t* imagePath) {
+   
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
+    BYTE* base = NULL;
+
+    IMAGE_DOS_HEADER* dos = NULL;
+    IMAGE_NT_HEADERS* nt = NULL;
+    IMAGE_DATA_DIRECTORY impDir; ZeroMemory(&impDir, sizeof(impDir));
+    IMAGE_IMPORT_DESCRIPTOR* imp = NULL;
+
+    BOOL  is64 = FALSE;
+
+    // open file and map
+    hFile = CreateFileW(imagePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) { WPRINT(L"[!] Open image failed: %s (err=%lu)\n", imagePath, GetLastError()); goto cleanup; }
+
+    hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { WPRINT(L"[!] CreateFileMapping failed (err=%lu)\n", GetLastError()); goto cleanup; }
+
+    base = (BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!base) { WPRINT(L"[!] MapViewOfFile failed (err=%lu)\n", GetLastError()); goto cleanup; }
+
+    // check PE headers 
+    dos = (IMAGE_DOS_HEADER*)base;
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) { WPRINT(L"[!] Not a DOS/PE file\n"); goto cleanup; }
+    if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x20000000) { WPRINT(L"[!] Suspicious e_lfanew: %ld\n", dos->e_lfanew); goto cleanup; }
+
+    nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) { WPRINT(L"[!] Bad NT signature\n"); goto cleanup; }
+
+    //  Determine 32/64 by actual header, regardless of build architecture 
+    is64 = (nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64) ||
+        (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+
+    if (is64)
+        impDir = ((IMAGE_OPTIONAL_HEADER64*)&nt->OptionalHeader)->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    else
+        impDir = ((IMAGE_OPTIONAL_HEADER32*)&nt->OptionalHeader)->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+    WPRINT(L"\n== PE Imports (from %s) ==\n", imagePath);
+    if (!impDir.VirtualAddress || !impDir.Size) { WPRINT(L"(No import directory)\n"); goto cleanup; }
+
+    imp = (IMAGE_IMPORT_DESCRIPTOR*)RvaToPtr(base, nt, impDir.VirtualAddress);
+    if (!imp) { WPRINT(L"[!] Failed to map import directory\n"); goto cleanup; }
+
+    //  Iterate over each imported DLL; print 1 line/DLL, functions separated by commas 
+    for (; imp->Name; ++imp) {
+        char* dllA = (char*)RvaToPtr(base, nt, imp->Name);
+        if (!dllA) continue;
+
+        wchar_t dllW[MAX_PATH];
+        MultiByteToWideChar(CP_ACP, 0, dllA, -1, dllW, MAX_PATH);
+
+        wchar_t line[4096];
+        line[0] = 0;
+        _snwprintf(line, _countof(line), L"%s: ", dllW);
+
+        bool first = true;
+        DWORD oftRva = imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk;
+
+        if (is64) {
+            IMAGE_THUNK_DATA64* thunk = (IMAGE_THUNK_DATA64*)RvaToPtr(base, nt, oftRva);
+            for (; thunk && thunk->u1.AddressOfData; ++thunk) {
+                if (!first) wcsncat_s(line, L", ", _TRUNCATE);
+                first = false;
+
+                if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
+                    wchar_t tmp[32];
+                    _snwprintf(tmp, _countof(tmp), L"#%u", (unsigned)(thunk->u1.Ordinal & 0xFFFF));
+                    wcsncat_s(line, tmp, _TRUNCATE);
+                }
+                else {
+                    IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)RvaToPtr(base, nt, (DWORD)thunk->u1.AddressOfData);
+                    if (ibn && ibn->Name) {
+                        wchar_t wfn[512];
+                        MultiByteToWideChar(CP_ACP, 0, (LPCSTR)ibn->Name, -1, wfn, _countof(wfn));
+                        wcsncat_s(line, wfn, _TRUNCATE);
+                    }
+                    else {
+                        wcsncat_s(line, L"(?)", _TRUNCATE);
+                    }
+                }
+            }
+        }
+        else {
+            IMAGE_THUNK_DATA32* thunk = (IMAGE_THUNK_DATA32*)RvaToPtr(base, nt, oftRva);
+            for (; thunk && thunk->u1.AddressOfData; ++thunk) {
+                if (!first) wcsncat_s(line, L", ", _TRUNCATE);
+                first = false;
+
+                if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32) {
+                    wchar_t tmp[32];
+                    _snwprintf(tmp, _countof(tmp), L"#%u", (unsigned)(thunk->u1.Ordinal & 0xFFFF));
+                    wcsncat_s(line, tmp, _TRUNCATE);
+                }
+                else {
+                    IMAGE_IMPORT_BY_NAME* ibn = (IMAGE_IMPORT_BY_NAME*)RvaToPtr(base, nt, thunk->u1.AddressOfData);
+                    if (ibn && ibn->Name) {
+                        wchar_t wfn[512];
+                        MultiByteToWideChar(CP_ACP, 0, (LPCSTR)ibn->Name, -1, wfn, _countof(wfn));
+                        wcsncat_s(line, wfn, _TRUNCATE);
+                    }
+                    else {
+                        wcsncat_s(line, L"(?)", _TRUNCATE);
+                    }
+                }
+            }
+        }
+
+        WPRINT(L"%s\n", line);
+    }
+
+cleanup:
+    if (base) UnmapViewOfFile(base);
+    if (hMap)  CloseHandle(hMap);
+    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+}
+
+
+// ===== main printing =====
+static void PrintProcessDetail(DWORD pid) {
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProc) { WPRINT(L"\n=== PID %lu ===\n[!] OpenProcess failed (err=%lu). Some info may be unavailable.\n", pid, GetLastError()); }
+
+    // get name exe and ppid
+    DWORD ppid = 0; wchar_t exeName[MAX_PATH] = L"(unknown)";
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) do {
+            if (pe.th32ProcessID == pid) { ppid = pe.th32ParentProcessID; wcsncpy(exeName, pe.szExeFile, MAX_PATH - 1); exeName[MAX_PATH - 1] = 0; break; }
+        } while (Process32NextW(snap, &pe));
+        CloseHandle(snap);
+    }
+
+    // file log "<name>-<PID>.txt"
+    wchar_t logName[MAX_PATH]; _snwprintf(logName, MAX_PATH, L"%s-%lu.txt", exeName, (unsigned long)pid);
+    gLog = _wfopen(logName, L"wt, ccs=UTF-8"); if (!gLog) gLog = _wfopen(logName, L"wt");
+
+    // Arch, path, cmdline
+    wchar_t arch[16] = L"Unknown", pathBuf[MAX_PATH] = L"(unavailable)"; BOOL is32 = FALSE;
+    if (hProc) {
+        GetProcessArchitecture(hProc, arch);
+        is32 = (_wcsicmp(arch, L"x86") == 0);
+#ifdef _WIN64
+        if (_wcsicmp(arch, L"ARM64") == 0) is32 = FALSE;
+#endif
+        GetProcessImagePath(hProc, pathBuf, MAX_PATH);
+    }
+    wchar_t* cmdLine = NULL; if (hProc && pNtQueryInformationProcess) GetProcessCommandLine(hProc, is32, &cmdLine);
+
+    WPRINT(L"=== Process ===\n");
+    WPRINT(L"Name process : %s\n", exeName);
+    WPRINT(L"PID          : %lu\n", pid);
+    WPRINT(L"PPID         : %lu\n", ppid);
+    WPRINT(L"Architecture : %s\n", arch);
+    WPRINT(L"Path         : %s\n", pathBuf);
+    WPRINT(L"Command line : %s\n", cmdLine ? cmdLine : L"(unavailable)");
+
+    // Threads, DLLs, Imports
+    PrintThreadsForPid(pid);
+    ListModules(pid, pathBuf);
+    PrintImportsFromImagePath(pathBuf);
+
+    if (cmdLine) free(cmdLine);
+    if (hProc) CloseHandle(hProc);
+    if (gLog) { fclose(gLog); gLog = NULL; }
+}
+
+static void Usage() {
+    WPRINT(L"Usage:\n  proc_enum.exe --pid <PID>\n  proc_enum.exe --name <process.exe>\n");
+}
+
+int wmain(int argc, wchar_t** argv) {
+    // Nt* APIs
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    pNtQuerySystemInformation = (PFN_NtQuerySystemInformation)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+    pNtQueryInformationProcess = (PFN_NtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+
+    if (argc != 3) { Usage(); return 1; }
+
+    if (_wcsicmp(argv[1], L"--pid") == 0) {
+        DWORD pid = (DWORD)_wtoi(argv[2]); PrintProcessDetail(pid); return 0;
+    }
+    if (_wcsicmp(argv[1], L"--name") == 0) {
+        const wchar_t* name = argv[2];
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) { WPRINT(L"[!] CreateToolhelp32Snapshot(PROCESS) failed (err=%lu)\n", GetLastError()); return 1; }
+        PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe); BOOL any = FALSE;
+        if (Process32FirstW(snap, &pe)) do {
+            if (_wcsicmp(pe.szExeFile, name) == 0) { any = TRUE; PrintProcessDetail(pe.th32ProcessID); }
+        } while (Process32NextW(snap, &pe));
+        CloseHandle(snap);
+        if (!any) { WPRINT(L"[!] No process named '%s' found.\n", name); return 2; }
+        return 0;
+    }
+
+    Usage(); return 1;
+}

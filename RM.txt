@@ -1,0 +1,74 @@
+              Windows Process Inspector
+
+A compact Windows console tool to inspect a running process and dump a tidy report to both the console and a log file.
+  proc_enum shows: process basics, threads, loaded DLLs, and PE imports (from on-disk image) — all in one go.
+
+
+
+ Highlights
+•	 Process basics: name, PID, PPID, architecture, full path, command line
+•	 Threads: TID, state, wait reason (via NtQuerySystemInformation)
+•	 Modules: DLLs only (main EXE excluded)
+•	 PE Imports: grouped by DLL, functions comma-separated (PE32/PE32+)
+•	Dual output: console + log file "<ProcessName>-<PID>.txt"
+Requirements
+•	Windows 10/11 or Windows Server 2016+
+•	MSVC / Visual Studio (x64 recommended)
+•	Links against psapi.lib (already included via #pragma comment(lib, "psapi.lib"))
+•	Administrator shell for best coverage (protected processes may restrict reads)
+•	Build
+•	Open a x64 Native Tools Command Prompt for VS and run:
+
+            cl /EHsc /W4 /O2 proc_enum.cpp /link psapi.lib
+
+You can also build x86; import parsing is based on the target file’s PE headers, not on the build architecture.
+Usage
+proc_enum.exe --pid <PID>
+proc_enum.exe --name <process.exe>
+Examples
+proc_enum.exe --pid 1234
+proc_enum.exe --name notepad.exe
+A log file with identical content will be created: notepad.exe-1234.txt.
+Sample Output
+Process
+=== Process ===
+Name process : notepad.exe
+PID          : 1234
+PPID         : 5678
+Architecture : x64
+Path         : C:\Program Files\WindowsApps\...\Notepad.exe
+Command line : "C:\...\Notepad.exe" "C:\...\readme.txt"
+Threads
+== Threads ==
+TID=9100; State=Running;  WaitReason=-
+TID=7328; State=Waiting;  WaitReason=WrUserRequest
+DLLs (EXE excluded)
+== DLLs ==
+KERNEL32.dll                           C:\Windows\System32\KERNEL32.dll
+USER32.dll                             C:\Windows\System32\USER32.dll
+PE Imports (from on-disk image)
+== PE Imports (from C:\...\Notepad.exe) ==
+KERNEL32.dll: GetProcAddress, LoadLibraryW, ExitProcess
+USER32.dll: CreateWindowExW, ShowWindow, UpdateWindow
+How It Works (Short)
+•	Architecture: IsWow64Process2 → fallback IsWow64Process
+•	Image path: QueryFullProcessImageNameW → fallback GetModuleFileNameExW
+•	Command line: NtQueryInformationProcess(ProcessBasicInformation) → read PEB → RTL_USER_PROCESS_PARAMETERS.CommandLine
+•	Threads: NtQuerySystemInformation(SystemProcessInformation) → SYSTEM_THREAD_INFORMATION[]
+•	Modules: CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|32) → filter EXE & non-DLL extensions
+•	Imports: memory-map the on-disk image → parse PE import directory → print “DLL: func1, func2, #ordinal”
+Notes & Limitations
+•	Some protected processes (e.g., AV/EDR, LSASS with PPL) may block OpenProcess/ReadProcessMemory.
+→ Run as Administrator and enable SeDebugPrivilege if needed.
+•	Import list reflects the file on disk, not the in-memory image (process hollowing may differ).
+•	Race conditions can occur if the target exits during enumeration; just rerun.
+•	Troubleshooting
+Symptom	Hint
+OpenProcess failed (err=5)	Access denied → run elevated
+Command line : (unavailable)	PEB read blocked → protected process
+No DLLs shown	Process exited between snapshots → rerun
+(No import directory)	Statically linked / packed / unusual PE
+Security & Privacy
+The tool reads process metadata and a tiny portion of memory (PEB & command line). Use it only on systems you own or have permission to inspect. Logs may contain sensitive arguments/paths.
+
+

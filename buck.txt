@@ -1,0 +1,264 @@
+Process Inspection Utility (proc_enum) — Trainer Report to Mentor
+
+Author (Trainer): [Your Name]
+Mentor: [Mentor’s Name]
+Cohort / Track: Windows Internals & Incident Response
+Date: [Insert Date]
+Version: 1.0
+
+1) Executive Overview
+
+proc_enum is a lightweight Windows console utility that inspects a target process and generates a synchronized report to console and log file. It consolidates:
+
+Process metadata: name, PID, PPID, architecture, full image path, command line
+
+Runtime state: thread IDs, thread states, wait reasons
+
+Loaded components: DLLs (EXE excluded)
+
+Static indicators: PE imports parsed from the on-disk executable (grouped by DLL, functions comma-separated)
+
+Use cases: rapid triage, blue-team forensics, debugging, reverse engineering warm-ups, classroom demonstrations of PEB/NT APIs.
+
+2) Learning Objectives (for Trainees)
+
+Read process environment (PEB) to retrieve the command line.
+
+Enumerate threads and interpret wait reasons via NT APIs.
+
+Distinguish modules (DLLs) from the main EXE in snapshots.
+
+Parse PE imports from on-disk binaries; understand name vs ordinal import.
+
+Apply safe Windows API patterns (toolhelp, memory mapping, error handling, cleanup discipline).
+
+3) Environment & Prerequisites
+
+OS: Windows 10/11 or Windows Server 2016+
+
+Compiler: Microsoft Visual C++ (MSVC)
+
+Libraries: psapi.lib (linked via #pragma comment(lib, "psapi.lib"))
+
+Privileges: Administrator recommended; SeDebugPrivilege improves coverage with protected processes (PPL/AV/EDR)
+
+4) Compilation
+
+Open x64 Native Tools Command Prompt for VS:
+
+cl /EHsc /W4 /O2 proc_enum.cpp /link psapi.lib
+
+
+x86 builds are supported. PE32 vs PE32+ is detected from the file’s headers, not the tool’s build architecture.
+
+5) Concept & Design Rationale
+
+Native APIs, no WMI: lower latency, fewer dependencies.
+
+Best-effort model: gracefully degrades when a target denies VM read; still shows what’s available.
+
+Clear output contract: four blocks (Process / Threads / DLLs / PE Imports), mirrored to log.
+
+Robust cleanup: deterministic resource release; “goto cleanup” used only with POD types.
+
+6) User Workflow
+proc_enum.exe --pid <PID>
+proc_enum.exe --name <process.exe>
+
+
+Produces console output and a log file: <ProcessName>-<PID>.txt.
+
+7) Implementation — Main Functions (Explained)
+
+All printing goes through WPRINT → console + log file.
+
+7.1 int wmain(int argc, wchar_t** argv)
+
+Role: Entry point, argument parsing, NT function resolution.
+
+Flow:
+
+Load NtQuerySystemInformation & NtQueryInformationProcess.
+
+Accept exactly one: --pid <PID> or --name <exe>.
+
+If by name: toolhelp snapshot to resolve one or more PIDs.
+
+For each PID → PrintProcessDetail(pid).
+
+7.2 static void PrintProcessDetail(DWORD pid) (core orchestrator)
+
+Collects & prints:
+
+OpenProcess (best effort).
+
+PPID & exe name: process snapshot.
+
+Log file: <ExeName>-<PID>.txt (UTF-8 if available).
+
+Architecture: GetProcessArchitecture.
+
+Image path: GetProcessImagePath.
+
+Command line: GetProcessCommandLine (PEB → RTL params).
+
+Threads: PrintThreadsForPid.
+
+DLLs: ListModules (EXE excluded; only .dll/.ocx/.drv).
+
+Imports: PrintImportsFromImagePath (grouped per DLL, comma-separated).
+
+Cleanup.
+
+7.3 static void GetProcessArchitecture(HANDLE hProc, wchar_t out[16])
+
+Purpose: Determine x86/x64/ARM64/Native via IsWow64Process2 (preferred) or IsWow64Process (fallback).
+
+7.4 static BOOL GetProcessImagePath(HANDLE hProc, wchar_t* buf, DWORD cch)
+
+Purpose: Full path resolution using QueryFullProcessImageNameW, fallback to GetModuleFileNameExW.
+
+7.5 static BOOL GetProcessCommandLine(HANDLE hProc, BOOL is32, wchar_t** outCmd)
+
+Purpose: Remote command line via PEB traversal.
+
+Steps:
+
+NtQueryInformationProcess(ProcessBasicInformation) → PEB address.
+
+Read minimal PEB (32/64) with ReadProcessMemory.
+
+Follow ProcessParameters to RTL_USER_PROCESS_PARAMETERS.CommandLine.
+
+ReadRemoteUnicodeString reads the UNICODE_STRING + buffer.
+
+7.6 static BOOL ReadRemoteUnicodeString(...)
+
+Purpose: Safely read UNICODE_STRING{32,64} and its wide char buffer from the target.
+
+7.7 static BOOL PrintThreadsForPid(DWORD pid)
+
+Purpose: Enumerate threads + states + wait reasons.
+
+Method: NtQuerySystemInformation(SystemProcessInformation) → find target process entry → iterate SYSTEM_THREAD_INFORMATION[].
+
+7.8 static void ListModules(DWORD pid, const wchar_t* mainImagePath)
+
+Purpose: Enumerate DLL-like modules only.
+
+Method: Toolhelp modules (TH32CS_SNAPMODULE|32), exclude mainImagePath, include only .dll/.ocx/.drv.
+
+7.9 static void PrintImportsFromImagePath(const wchar_t* imagePath)
+
+Purpose: On-disk PE import parsing (stable, deterministic).
+
+Method:
+
+CreateFile + CreateFileMapping + MapViewOfFile (read-only).
+
+Validate MZ/PE headers.
+
+Detect PE32 vs PE32+ via Machine/Magic (independent of build arch).
+
+For each DLL: print a single line with functions comma-separated (name or #ordinal).
+
+RVA → pointer via RvaToPtr.
+
+7.10 Utilities
+
+ThreadStateName, WaitReasonToString: enum to readable labels.
+
+RvaToPtr: section-aware RVA translation.
+
+SamePathNoCase, HasDllLikeExt: path filtering helpers.
+
+WPRINT / vwprint_both: unified output.
+
+8) Key Challenges & Mitigations
+Challenge	Why It Matters	Mitigation Implemented
+Protected processes (PPL/AV/EDR) block VM reads	Command line & threads may be unavailable	Run elevated, enable SeDebugPrivilege; graceful fallback (print “(unavailable)”)
+Toolhelp includes main EXE in module list	DLL list would be misleading	Exclude main image by absolute path; filter by .dll/.ocx/.drv
+Overly verbose imports	Hard to scan	One line per DLL, functions comma-separated
+MSVC warning “transfer of control bypasses initialization”	Cleanup & safety concerns	Kept goto cleanup, but only with POD in that scope (no C++ objects with ctors)
+PE32 vs PE32+ detection	Wrong parse if tied to build arch	Detect from the file (Machine/Magic), not the tool build
+9) Testing Summary
+
+Functional: Notepad/Calc; both x64 and WOW64 targets.
+
+Permissions: Elevated vs non-elevated; confirmed graceful degradation.
+
+Resilience: Target exiting mid-inspection doesn’t crash the tool; partial output preserved.
+
+Formatting: Confirmed DLL exclusion of EXE; imports grouped per DLL; UTF-8 logs verified.
+
+10) Sample Output (Abbreviated)
+=== Process ===
+Name process : notepad.exe
+PID          : 1234
+PPID         : 5678
+Architecture : x64
+Path         : C:\Program Files\WindowsApps\...\Notepad.exe
+Command line : "C:\...\Notepad.exe" "C:\...\readme.txt"
+
+== Threads ==
+TID=9100; State=Running;  WaitReason=-
+TID=7328; State=Waiting;  WaitReason=WrUserRequest
+
+== DLLs ==
+KERNEL32.dll                           C:\Windows\System32\KERNEL32.dll
+USER32.dll                             C:\Windows\System32\USER32.dll
+
+== PE Imports (from C:\...\Notepad.exe) ==
+KERNEL32.dll: GetProcAddress, LoadLibraryW, ExitProcess
+USER32.dll: CreateWindowExW, ShowWindow, UpdateWindow
+
+11) Trainer Evaluation (What Trainees Demonstrated)
+
+Correct use of Toolhelp, NT APIs, and safe ReadProcessMemory patterns.
+
+Awareness of PEB structure and RTL parameters layout.
+
+Ability to debug permission issues and still deliver partial insights.
+
+Sensible formatting for operator consumption (grouped imports, concise DLL list).
+
+12) Risks, Privacy & Compliance
+
+Command lines may contain sensitive parameters. Treat logs as confidential.
+
+Operate only on systems with proper authorization.
+
+Some organizations restrict SeDebugPrivilege; training included handling degraded output.
+
+13) Recommendations & Next Steps
+
+Add --imports-all to analyze imports for all loaded modules (not only the main EXE).
+
+Provide JSON/YAML export for SIEM pipelines.
+
+Introduce optional in-memory imports (Ldr lists) to detect hollowing/patching vs on-disk imports.
+
+Offer an HTML/TUI reporter for richer navigation (folding sections, search).
+
+14) Appendix
+14.1 Build Command (Copy-Paste)
+cl /EHsc /W4 /O2 proc_enum.cpp /link psapi.lib
+
+14.2 Glossary (Non-Specialist)
+
+PID/PPID: Process ID / Parent Process ID
+
+PEB: Process Environment Block (Windows internal metadata block)
+
+Thread & Wait Reason: Unit of execution and why it is waiting
+
+DLL: Dynamic-link library (shared code)
+
+PE, PE32+: Windows executable format (32-bit / 64-bit)
+
+Imports: Functions a program consumes from DLLs
+
+Prepared by (Trainer): [Your Name]
+Contact: [Email / Teams / Slack]
+
+Approval (Mentor): ______________________ Date: __________
